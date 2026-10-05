@@ -1,0 +1,43 @@
+name: Build HDValheimUpdated
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "HDValheimUpdated/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore .\HDValheimUpdated\HDValheimUpdated.csproj
+
+      - name: Build
+        run: dotnet build .\HDValheimUpdated\HDValheimUpdated.csproj -c Release --no-restore
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package\BepInEx\plugins\HDValheimUpdated\Textures | Out-Null
+          Copy-Item .\HDValheimUpdated\bin\Release\netstandard2.1\HDValheimUpdated.dll package\BepInEx\plugins\HDValheimUpdated\HDValheimUpdated.dll
+          Copy-Item .\HDValheimUpdated\HDValheimUpdated.cfg.example package\BepInEx\plugins\HDValheimUpdated\HDValheimUpdated.cfg.example
+          "Place exported HD textures here." | Set-Content package\BepInEx\plugins\HDValheimUpdated\Textures\PUT_TEXTURES_HERE.txt
+
+      - name: Upload DLL package
+        uses: actions/upload-artifact@v4
+        with:
+          name: HDValheimUpdated-DLL
+          path: package
+          if-no-files-found: error
