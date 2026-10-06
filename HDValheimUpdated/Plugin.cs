@@ -16,7 +16,7 @@ namespace HDValheimUpdated
     {
         public const string PluginGuid = "lidia.hdvalheimupdated";
         public const string PluginName = "HD Valheim Updated";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.2.0";
 
         internal static ManualLogSource Log = null!;
 
@@ -26,66 +26,111 @@ namespace HDValheimUpdated
         private ConfigEntry<KeyboardShortcut> _reloadHotkey = null!;
         private ConfigEntry<bool> _logEachReplacement = null!;
         private ConfigEntry<bool> _caseInsensitiveNames = null!;
-        private ConfigEntry<int> _maxTextureSize = null!;
         private ConfigEntry<bool> _generateMipMaps = null!;
+        private ConfigEntry<int> _materialsPerFrame = null!;
 
         private Coroutine? _loadRoutine;
-        private readonly Dictionary<string, byte[]> _replacementCache =
-            new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+
+        // Храним только пути, чтобы не читать 2+ ГБ изображений в RAM сразу.
+        private readonly Dictionary<string, string> _texturePaths =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // Одна HD-текстура на одно внутреннее имя.
+        private readonly Dictionary<string, Texture2D> _loadedTextures =
+            new Dictionary<string, Texture2D>(StringComparer.OrdinalIgnoreCase);
 
         private void Awake()
         {
             Log = Logger;
-            _enabled = Config.Bind("General", "Enabled", true, "Включить подмену HD-текстур.");
-            _textureDirectory = Config.Bind("General", "TextureDirectory", "Textures", "Папка с текстурами относительно папки плагина. PNG/JPG.");
-            _loadDelay = Config.Bind("General", "LoadDelaySeconds", 5.0f, "Задержка после загрузки сцены перед поиском текстур.");
-            _reloadHotkey = Config.Bind("General", "ReloadHotkey", new KeyboardShortcut(KeyCode.F8), "Горячая клавиша повторной загрузки текстур.");
-            _logEachReplacement = Config.Bind("Logging", "LogEachReplacement", false, "Писать в лог каждую заменённую текстуру.");
-            _caseInsensitiveNames = Config.Bind("Matching", "CaseInsensitiveNames", true, "Сопоставлять имена текстур без учёта регистра.");
-            _maxTextureSize = Config.Bind("Performance", "MaxTextureSize", 0, "0 = без ограничения; иначе максимум стороны текстуры.");
-            _generateMipMaps = Config.Bind("Performance", "GenerateMipMaps", true, "Создавать mip-map уровни после загрузки.");
+
+            _enabled = Config.Bind("General", "Enabled", true,
+                "Включить подмену HD-текстур.");
+
+            _textureDirectory = Config.Bind("General", "TextureDirectory", "Textures",
+                "Папка с текстурами относительно папки плагина. PNG/JPG.");
+
+            _loadDelay = Config.Bind("General", "LoadDelaySeconds", 8.0f,
+                "Задержка после загрузки сцены перед поиском материалов.");
+
+            _reloadHotkey = Config.Bind("General", "ReloadHotkey",
+                new KeyboardShortcut(KeyCode.F8),
+                "Повторно просканировать материалы и применить HD-текстуры.");
+
+            _logEachReplacement = Config.Bind("Logging", "LogEachReplacement", false,
+                "Писать в лог каждую замену.");
+
+            _caseInsensitiveNames = Config.Bind("Matching", "CaseInsensitiveNames", true,
+                "Сопоставлять имена без учёта регистра.");
+
+            _generateMipMaps = Config.Bind("Performance", "GenerateMipMaps", true,
+                "Генерировать mipmaps у новых HD-текстур.");
+
+            _materialsPerFrame = Config.Bind("Performance", "MaterialsPerFrame", 25,
+                "Сколько материалов обрабатывать за кадр. Меньше = меньше фризов.");
 
             SceneManager.sceneLoaded += OnSceneLoaded;
+
             Logger.LogInfo($"{PluginName} {PluginVersion} loaded.");
             ScheduleReload();
         }
 
-        private void OnDestroy() => SceneManager.sceneLoaded -= OnSceneLoaded;
+        private void OnDestroy()
+        {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+        }
 
         private void Update()
         {
             if (_enabled.Value && _reloadHotkey.Value.IsDown())
             {
-                Logger.LogInfo("Manual texture reload requested.");
+                Logger.LogInfo("Manual texture rescan requested.");
                 ScheduleReload();
             }
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
         {
-            if (_enabled.Value) ScheduleReload();
+            if (_enabled.Value)
+                ScheduleReload();
         }
 
         private void ScheduleReload()
         {
-            if (!_enabled.Value) return;
-            if (_loadRoutine != null) StopCoroutine(_loadRoutine);
+            if (!_enabled.Value)
+                return;
+
+            if (_loadRoutine != null)
+                StopCoroutine(_loadRoutine);
+
             _loadRoutine = StartCoroutine(ReloadDelayed());
         }
 
         private IEnumerator ReloadDelayed()
         {
             yield return new WaitForSecondsRealtime(Mathf.Max(0f, _loadDelay.Value));
-            try { ReloadTextures(); }
-            catch (Exception ex) { Logger.LogError($"Texture reload failed: {ex}"); }
+
+            BuildTexturePathIndex();
+
+            if (_texturePaths.Count == 0)
+            {
+                Logger.LogWarning("No PNG/JPG textures found. HD pass skipped.");
+                _loadRoutine = null;
+                yield break;
+            }
+
+            yield return StartCoroutine(ReplaceMaterialTexturesCoroutine());
             _loadRoutine = null;
         }
 
-        private void ReloadTextures()
+        private void BuildTexturePathIndex()
         {
+            _texturePaths.Clear();
+
             string pluginDir = Path.GetDirectoryName(Info.Location) ?? Paths.PluginPath;
             string texDir = _textureDirectory.Value;
-            if (!Path.IsPathRooted(texDir)) texDir = Path.Combine(pluginDir, texDir);
+
+            if (!Path.IsPathRooted(texDir))
+                texDir = Path.Combine(pluginDir, texDir);
 
             if (!Directory.Exists(texDir))
             {
@@ -94,80 +139,158 @@ namespace HDValheimUpdated
                 return;
             }
 
-            BuildReplacementCache(texDir);
-            if (_replacementCache.Count == 0)
-            {
-                Logger.LogWarning($"No PNG/JPG textures found in: {texDir}");
-                return;
-            }
-
-            Texture2D[] liveTextures = Resources.FindObjectsOfTypeAll<Texture2D>();
-            var comparer = _caseInsensitiveNames.Value ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-            var byName = liveTextures
-                .Where(t => t != null && !string.IsNullOrWhiteSpace(t.name))
-                .GroupBy(t => t.name, comparer)
-                .ToDictionary(g => g.Key, g => g.ToList(), comparer);
-
-            int matched = 0, replaced = 0, failed = 0;
-
-            foreach (var pair in _replacementCache)
-            {
-                if (!byName.TryGetValue(pair.Key, out var targets)) continue;
-                matched++;
-
-                foreach (var target in targets)
-                {
-                    try
-                    {
-                        ReplaceTextureInPlace(target, pair.Value);
-                        replaced++;
-                        if (_logEachReplacement.Value)
-                            Logger.LogInfo($"Replaced: {target.name} ({target.width}x{target.height})");
-                    }
-                    catch (Exception ex)
-                    {
-                        failed++;
-                        Logger.LogWarning($"Failed '{target.name}': {ex.Message}");
-                    }
-                }
-            }
-
-            Logger.LogInfo($"HD pass complete. Files={_replacementCache.Count}, matched={matched}, replaced={replaced}, failed={failed}, scanned={liveTextures.Length}");
-        }
-
-        private void BuildReplacementCache(string texDir)
-        {
-            _replacementCache.Clear();
             foreach (string path in Directory.GetFiles(texDir, "*.*", SearchOption.AllDirectories))
             {
                 string ext = Path.GetExtension(path).ToLowerInvariant();
-                if (ext != ".png" && ext != ".jpg" && ext != ".jpeg") continue;
+                if (ext != ".png" && ext != ".jpg" && ext != ".jpeg")
+                    continue;
 
-                string key = Path.GetFileNameWithoutExtension(path);
-                if (string.IsNullOrWhiteSpace(key)) continue;
+                string name = Path.GetFileNameWithoutExtension(path);
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
 
-                try { _replacementCache[key] = File.ReadAllBytes(path); }
-                catch (Exception ex) { Logger.LogWarning($"Cannot read '{path}': {ex.Message}"); }
+                _texturePaths[name] = path;
             }
+
+            Logger.LogInfo($"Indexed {_texturePaths.Count} HD texture files.");
         }
 
-        private void ReplaceTextureInPlace(Texture2D target, byte[] encodedImage)
+        private IEnumerator ReplaceMaterialTexturesCoroutine()
         {
-            var filter = target.filterMode;
-            var wrapU = target.wrapModeU;
-            var wrapV = target.wrapModeV;
-            int aniso = target.anisoLevel;
-            float mipBias = target.mipMapBias;
+            Material[] materials = Resources.FindObjectsOfTypeAll<Material>();
 
-            if (!ImageConversion.LoadImage(target, encodedImage, false))
+            int scannedMaterials = 0;
+            int scannedSlots = 0;
+            int matchedSlots = 0;
+            int replacedSlots = 0;
+            int failedSlots = 0;
+            int processedThisFrame = 0;
+
+            foreach (Material material in materials)
+            {
+                if (material == null)
+                    continue;
+
+                scannedMaterials++;
+                processedThisFrame++;
+
+                string[] textureProperties;
+                try
+                {
+                    textureProperties = material.GetTexturePropertyNames();
+                }
+                catch
+                {
+                    textureProperties = Array.Empty<string>();
+                }
+
+                foreach (string propertyName in textureProperties)
+                {
+                    Texture? sourceTexture = null;
+
+                    try
+                    {
+                        sourceTexture = material.GetTexture(propertyName);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (sourceTexture == null || string.IsNullOrWhiteSpace(sourceTexture.name))
+                        continue;
+
+                    scannedSlots++;
+
+                    string sourceName = sourceTexture.name;
+
+                    if (!_texturePaths.TryGetValue(sourceName, out string? imagePath))
+                    {
+                        if (_caseInsensitiveNames.Value)
+                        {
+                            var match = _texturePaths.FirstOrDefault(
+                                p => string.Equals(p.Key, sourceName, StringComparison.OrdinalIgnoreCase));
+
+                            if (!string.IsNullOrEmpty(match.Key))
+                                imagePath = match.Value;
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(imagePath))
+                        continue;
+
+                    matchedSlots++;
+
+                    try
+                    {
+                        Texture2D replacement = GetOrLoadReplacement(sourceName, imagePath, sourceTexture as Texture2D);
+                        material.SetTexture(propertyName, replacement);
+                        replacedSlots++;
+
+                        if (_logEachReplacement.Value)
+                            Logger.LogInfo($"Replaced material '{material.name}' property '{propertyName}' using '{sourceName}'.");
+                    }
+                    catch (Exception ex)
+                    {
+                        failedSlots++;
+                        Logger.LogWarning($"Failed material '{material.name}' property '{propertyName}' / '{sourceName}': {ex.Message}");
+                    }
+                }
+
+                if (processedThisFrame >= Mathf.Max(1, _materialsPerFrame.Value))
+                {
+                    processedThisFrame = 0;
+                    yield return null;
+                }
+            }
+
+            Logger.LogInfo(
+                $"HD material pass complete. Files={_texturePaths.Count}, " +
+                $"materials={scannedMaterials}, slots={scannedSlots}, matched={matchedSlots}, " +
+                $"replaced={replacedSlots}, failed={failedSlots}, loadedHD={_loadedTextures.Count}");
+        }
+
+        private Texture2D GetOrLoadReplacement(string textureName, string imagePath, Texture2D? source)
+        {
+            if (_loadedTextures.TryGetValue(textureName, out Texture2D? cached) && cached != null)
+                return cached;
+
+            byte[] bytes = File.ReadAllBytes(imagePath);
+
+            // Ключевой фикс v0.2.0:
+            // НЕ пытаемся менять исходную Texture2D Valheim.
+            // Многие игровые текстуры помечены non-readable, поэтому LoadImage/Apply на них падает.
+            // Вместо этого создаём новый читаемый Texture2D и назначаем его материалу.
+            Texture2D replacement = new Texture2D(
+                2,
+                2,
+                TextureFormat.RGBA32,
+                _generateMipMaps.Value);
+
+            replacement.name = textureName;
+
+            if (!ImageConversion.LoadImage(replacement, bytes, false))
+            {
+                UnityEngine.Object.Destroy(replacement);
                 throw new InvalidOperationException("ImageConversion.LoadImage returned false.");
+            }
 
-            target.filterMode = filter;
-            target.wrapModeU = wrapU;
-            target.wrapModeV = wrapV;
-            target.anisoLevel = aniso;
-            target.mipMapBias = mipBias;
-            target.Apply(_generateMipMaps.Value, false);
+            if (source != null)
+            {
+                replacement.filterMode = source.filterMode;
+                replacement.wrapMode = source.wrapMode;
+                replacement.wrapModeU = source.wrapModeU;
+                replacement.wrapModeV = source.wrapModeV;
+                replacement.anisoLevel = source.anisoLevel;
+                replacement.mipMapBias = source.mipMapBias;
+            }
+
+            // LoadImage уже загружает пиксели в GPU. Apply нужен только для обновления mipmaps.
+            if (_generateMipMaps.Value)
+                replacement.Apply(true, false);
+
+            _loadedTextures[textureName] = replacement;
+            return replacement;
         }
     }
 }
