@@ -16,7 +16,7 @@ namespace HDValheimUpdated
     {
         public const string PluginGuid = "lidia.hdvalheimupdated";
         public const string PluginName = "HD Valheim Updated";
-        public const string PluginVersion = "0.3.0";
+        public const string PluginVersion = "0.3.1";
 
         internal static ManualLogSource Log = null!;
 
@@ -70,7 +70,7 @@ namespace HDValheimUpdated
             _materialsPerFrame = Config.Bind("Performance", "MaterialsPerFrame", 25,
                 "Сколько материалов обрабатывать за кадр. Меньше = меньше фризов.");
 
-            _repackNormalMaps = Config.Bind("Rendering", "RepackNormalMaps", true,
+            _repackNormalMaps = Config.Bind("Rendering", "RepackNormalMaps", false,
                 "Перепаковывать RGB normal maps из PNG в формат, который ожидают Unity/Valheim shaders.");
 
             SceneManager.sceneLoaded += OnSceneLoaded;
