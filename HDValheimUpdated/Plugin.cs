@@ -16,7 +16,7 @@ namespace HDValheimUpdated
     {
         public const string PluginGuid = "lidia.hdvalheimupdated";
         public const string PluginName = "HD Valheim Updated";
-        public const string PluginVersion = "0.3.1";
+        public const string PluginVersion = "0.3.2";
 
         internal static ManualLogSource Log = null!;
 
@@ -29,6 +29,7 @@ namespace HDValheimUpdated
         private ConfigEntry<bool> _generateMipMaps = null!;
         private ConfigEntry<int> _materialsPerFrame = null!;
         private ConfigEntry<bool> _repackNormalMaps = null!;
+        private ConfigEntry<bool> _replaceTerrainMaterials = null!;
 
         private Coroutine? _loadRoutine;
 
@@ -72,6 +73,9 @@ namespace HDValheimUpdated
 
             _repackNormalMaps = Config.Bind("Rendering", "RepackNormalMaps", false,
                 "Перепаковывать RGB normal maps из PNG в формат, который ожидают Unity/Valheim shaders.");
+
+            _replaceTerrainMaterials = Config.Bind("Rendering", "ReplaceTerrainMaterials", false,
+                "Подменять terrain/ground материалы. По умолчанию выключено из-за некорректного отображения земли в актуальном Valheim.");
 
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -172,6 +176,7 @@ namespace HDValheimUpdated
             int normalSlots = 0;
             int linearSlots = 0;
             int processedThisFrame = 0;
+            int skippedTerrainMaterials = 0;
 
             foreach (Material material in materials)
             {
@@ -180,6 +185,19 @@ namespace HDValheimUpdated
 
                 scannedMaterials++;
                 processedThisFrame++;
+
+                if (!_replaceTerrainMaterials.Value && IsTerrainMaterial(material))
+                {
+                    skippedTerrainMaterials++;
+
+                    if (processedThisFrame >= Mathf.Max(1, _materialsPerFrame.Value))
+                    {
+                        processedThisFrame = 0;
+                        yield return null;
+                    }
+
+                    continue;
+                }
 
                 string[] textureProperties;
                 try
@@ -259,7 +277,32 @@ namespace HDValheimUpdated
                 $"HD material pass complete. Files={_texturePaths.Count}, " +
                 $"materials={scannedMaterials}, slots={scannedSlots}, matched={matchedSlots}, " +
                 $"replaced={replacedSlots}, failed={failedSlots}, " +
-                $"normalSlots={normalSlots}, linearSlots={linearSlots}, loadedHD={_loadedTextures.Count}");
+                $"normalSlots={normalSlots}, linearSlots={linearSlots}, " +
+                $"skippedTerrainMaterials={skippedTerrainMaterials}, loadedHD={_loadedTextures.Count}");
+        }
+
+        private static bool IsTerrainMaterial(Material material)
+        {
+            string materialName = (material.name ?? string.Empty).ToLowerInvariant();
+            string shaderName = material.shader != null
+                ? (material.shader.name ?? string.Empty).ToLowerInvariant()
+                : string.Empty;
+
+            // В Valheim земля/террейн рендерятся специализированными шейдерами.
+            // Старый HD-пак был сделан под прежнюю версию игры, и простая подмена
+            // их texture slots даёт растянутую/слишком тёмную поверхность.
+            if (shaderName.Contains("heightmap") ||
+                shaderName.Contains("terrain") ||
+                shaderName.Contains("ground"))
+                return true;
+
+            if (materialName.Contains("heightmap") ||
+                materialName.Contains("terrain") ||
+                materialName.StartsWith("ground") ||
+                materialName.Contains("_ground"))
+                return true;
+
+            return false;
         }
 
         private string? FindTexturePath(string sourceName)
