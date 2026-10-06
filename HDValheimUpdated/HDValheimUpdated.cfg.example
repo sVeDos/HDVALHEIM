@@ -15,4 +15,5 @@ GenerateMipMaps = true
 MaterialsPerFrame = 25
 
 [Rendering]
-RepackNormalMaps = true
+RepackNormalMaps = false
+ReplaceTerrainMaterials = false
