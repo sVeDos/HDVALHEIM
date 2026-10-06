@@ -13,3 +13,6 @@ LogEachReplacement = false
 [Performance]
 GenerateMipMaps = true
 MaterialsPerFrame = 25
+
+[Rendering]
+RepackNormalMaps = true
