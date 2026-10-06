@@ -1,7 +1,7 @@
 [General]
 Enabled = true
 TextureDirectory = Textures
-LoadDelaySeconds = 5
+LoadDelaySeconds = 8
 ReloadHotkey = F8
 
 [Matching]
@@ -11,5 +11,5 @@ CaseInsensitiveNames = true
 LogEachReplacement = false
 
 [Performance]
-MaxTextureSize = 0
 GenerateMipMaps = true
+MaterialsPerFrame = 25
