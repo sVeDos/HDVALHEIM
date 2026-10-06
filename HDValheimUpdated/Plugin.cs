@@ -16,7 +16,7 @@ namespace HDValheimUpdated
     {
         public const string PluginGuid = "lidia.hdvalheimupdated";
         public const string PluginName = "HD Valheim Updated";
-        public const string PluginVersion = "0.2.0";
+        public const string PluginVersion = "0.3.0";
 
         internal static ManualLogSource Log = null!;
 
@@ -28,14 +28,16 @@ namespace HDValheimUpdated
         private ConfigEntry<bool> _caseInsensitiveNames = null!;
         private ConfigEntry<bool> _generateMipMaps = null!;
         private ConfigEntry<int> _materialsPerFrame = null!;
+        private ConfigEntry<bool> _repackNormalMaps = null!;
 
         private Coroutine? _loadRoutine;
 
-        // Храним только пути, чтобы не читать 2+ ГБ изображений в RAM сразу.
+        // Храним только пути: 2+ ГБ изображений не загружаются в RAM заранее.
         private readonly Dictionary<string, string> _texturePaths =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        // Одна HD-текстура на одно внутреннее имя.
+        // Кэш учитывает тип карты, потому что один и тот же файл теоретически
+        // может быть назначен как цветовая и как linear/normal карта.
         private readonly Dictionary<string, Texture2D> _loadedTextures =
             new Dictionary<string, Texture2D>(StringComparer.OrdinalIgnoreCase);
 
@@ -67,6 +69,9 @@ namespace HDValheimUpdated
 
             _materialsPerFrame = Config.Bind("Performance", "MaterialsPerFrame", 25,
                 "Сколько материалов обрабатывать за кадр. Меньше = меньше фризов.");
+
+            _repackNormalMaps = Config.Bind("Rendering", "RepackNormalMaps", true,
+                "Перепаковывать RGB normal maps из PNG в формат, который ожидают Unity/Valheim shaders.");
 
             SceneManager.sceneLoaded += OnSceneLoaded;
 
@@ -164,6 +169,8 @@ namespace HDValheimUpdated
             int matchedSlots = 0;
             int replacedSlots = 0;
             int failedSlots = 0;
+            int normalSlots = 0;
+            int linearSlots = 0;
             int processedThisFrame = 0;
 
             foreach (Material material in materials)
@@ -186,7 +193,7 @@ namespace HDValheimUpdated
 
                 foreach (string propertyName in textureProperties)
                 {
-                    Texture? sourceTexture = null;
+                    Texture? sourceTexture;
 
                     try
                     {
@@ -203,37 +210,41 @@ namespace HDValheimUpdated
                     scannedSlots++;
 
                     string sourceName = sourceTexture.name;
-
-                    if (!_texturePaths.TryGetValue(sourceName, out string? imagePath))
-                    {
-                        if (_caseInsensitiveNames.Value)
-                        {
-                            var match = _texturePaths.FirstOrDefault(
-                                p => string.Equals(p.Key, sourceName, StringComparison.OrdinalIgnoreCase));
-
-                            if (!string.IsNullOrEmpty(match.Key))
-                                imagePath = match.Value;
-                        }
-                    }
+                    string? imagePath = FindTexturePath(sourceName);
 
                     if (string.IsNullOrEmpty(imagePath))
                         continue;
 
                     matchedSlots++;
 
+                    MapKind kind = ClassifyMap(propertyName, sourceName);
+                    if (kind == MapKind.Normal) normalSlots++;
+                    if (kind != MapKind.Color) linearSlots++;
+
                     try
                     {
-                        Texture2D replacement = GetOrLoadReplacement(sourceName, imagePath, sourceTexture as Texture2D);
+                        Texture2D replacement = GetOrLoadReplacement(
+                            sourceName,
+                            imagePath,
+                            sourceTexture as Texture2D,
+                            kind);
+
                         material.SetTexture(propertyName, replacement);
                         replacedSlots++;
 
                         if (_logEachReplacement.Value)
-                            Logger.LogInfo($"Replaced material '{material.name}' property '{propertyName}' using '{sourceName}'.");
+                        {
+                            Logger.LogInfo(
+                                $"Replaced material '{material.name}' property '{propertyName}' " +
+                                $"using '{sourceName}' as {kind}.");
+                        }
                     }
                     catch (Exception ex)
                     {
                         failedSlots++;
-                        Logger.LogWarning($"Failed material '{material.name}' property '{propertyName}' / '{sourceName}': {ex.Message}");
+                        Logger.LogWarning(
+                            $"Failed material '{material.name}' property '{propertyName}' / " +
+                            $"'{sourceName}': {ex.Message}");
                     }
                 }
 
@@ -247,25 +258,78 @@ namespace HDValheimUpdated
             Logger.LogInfo(
                 $"HD material pass complete. Files={_texturePaths.Count}, " +
                 $"materials={scannedMaterials}, slots={scannedSlots}, matched={matchedSlots}, " +
-                $"replaced={replacedSlots}, failed={failedSlots}, loadedHD={_loadedTextures.Count}");
+                $"replaced={replacedSlots}, failed={failedSlots}, " +
+                $"normalSlots={normalSlots}, linearSlots={linearSlots}, loadedHD={_loadedTextures.Count}");
         }
 
-        private Texture2D GetOrLoadReplacement(string textureName, string imagePath, Texture2D? source)
+        private string? FindTexturePath(string sourceName)
         {
-            if (_loadedTextures.TryGetValue(textureName, out Texture2D? cached) && cached != null)
+            if (_texturePaths.TryGetValue(sourceName, out string? path))
+                return path;
+
+            if (!_caseInsensitiveNames.Value)
+                return null;
+
+            foreach (var pair in _texturePaths)
+            {
+                if (string.Equals(pair.Key, sourceName, StringComparison.OrdinalIgnoreCase))
+                    return pair.Value;
+            }
+
+            return null;
+        }
+
+        private enum MapKind
+        {
+            Color,
+            Linear,
+            Normal
+        }
+
+        private static MapKind ClassifyMap(string propertyName, string textureName)
+        {
+            string p = propertyName.ToLowerInvariant();
+            string n = textureName.ToLowerInvariant();
+
+            // Normal maps: по shader property и по распространённому суффиксу старого HD-пака.
+            if (p.Contains("bump") || p.Contains("normal") ||
+                n.EndsWith("_n") || n.EndsWith("_normal") || n.Contains("normal"))
+                return MapKind.Normal;
+
+            // Данные, которые нельзя интерпретировать через sRGB.
+            if (p.Contains("metal") || p.Contains("mask") || p.Contains("occlusion") ||
+                p.Contains("rough") || p.Contains("smooth") || p.Contains("height") ||
+                p.Contains("parallax") || p.Contains("detailmask") ||
+                n.EndsWith("_m") || n.EndsWith("_mask") || n.EndsWith("_e") ||
+                n.Contains("metal") || n.Contains("rough") || n.Contains("occlusion"))
+                return MapKind.Linear;
+
+            return MapKind.Color;
+        }
+
+        private Texture2D GetOrLoadReplacement(
+            string textureName,
+            string imagePath,
+            Texture2D? source,
+            MapKind kind)
+        {
+            string cacheKey = $"{kind}:{textureName}";
+
+            if (_loadedTextures.TryGetValue(cacheKey, out Texture2D? cached) && cached != null)
                 return cached;
 
             byte[] bytes = File.ReadAllBytes(imagePath);
 
-            // Ключевой фикс v0.2.0:
-            // НЕ пытаемся менять исходную Texture2D Valheim.
-            // Многие игровые текстуры помечены non-readable, поэтому LoadImage/Apply на них падает.
-            // Вместо этого создаём новый читаемый Texture2D и назначаем его материалу.
+            bool linear = kind != MapKind.Color;
+
+            // В отличие от v0.1 мы не изменяем non-readable Texture2D игры.
+            // Создаём новый объект. Для normal/mask/metal/occlusion используем linear=true.
             Texture2D replacement = new Texture2D(
                 2,
                 2,
                 TextureFormat.RGBA32,
-                _generateMipMaps.Value);
+                _generateMipMaps.Value,
+                linear);
 
             replacement.name = textureName;
 
@@ -274,6 +338,9 @@ namespace HDValheimUpdated
                 UnityEngine.Object.Destroy(replacement);
                 throw new InvalidOperationException("ImageConversion.LoadImage returned false.");
             }
+
+            if (kind == MapKind.Normal && _repackNormalMaps.Value)
+                RepackNormalMapForUnity(replacement);
 
             if (source != null)
             {
@@ -285,12 +352,30 @@ namespace HDValheimUpdated
                 replacement.mipMapBias = source.mipMapBias;
             }
 
-            // LoadImage уже загружает пиксели в GPU. Apply нужен только для обновления mipmaps.
             if (_generateMipMaps.Value)
                 replacement.Apply(true, false);
 
-            _loadedTextures[textureName] = replacement;
+            _loadedTextures[cacheKey] = replacement;
             return replacement;
+        }
+
+        private static void RepackNormalMapForUnity(Texture2D texture)
+        {
+            // AssetRipper экспортирует normal map как обычное RGB-изображение.
+            // В desktop-шейдерах Unity UnpackNormal часто читает X из A и Y из G.
+            // Поэтому переносим R -> A, сохраняем G, а R/B ставим в 1.
+            // Это совместимо с UnpackNormalmapRGorAG: normal.xy = packed.wy,
+            // normal.x *= packed.x; при R=1 X берётся из A.
+            Color32[] pixels = texture.GetPixels32();
+
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                Color32 c = pixels[i];
+                pixels[i] = new Color32(255, c.g, 255, c.r);
+            }
+
+            texture.SetPixels32(pixels);
+            texture.Apply(true, false);
         }
     }
 }
